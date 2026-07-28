@@ -74,7 +74,7 @@ function App() {
   }
 
   const handleAuthChange = (event) => {
-    const { name, value } = event.targetthat
+    const { name, value } = event.target
     setAuthForm((prev) => ({ ...prev, [name]: value }))
   }
 
