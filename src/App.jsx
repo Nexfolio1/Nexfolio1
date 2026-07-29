@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import './App.css'
+import { hasSupabaseConfig, supabase } from './lib/supabase'
 
 const defaultProfile = {
   name: '',
@@ -10,11 +11,12 @@ const defaultProfile = {
   featuredWork: ''
 }
 
-const defaultCreatorForm = { name: '', email: '' }
+const defaultCreatorForm = { name: '', email: '', password: '' }
 const defaultRecruiterForm = {
   companyName: '',
   contactName: '',
   email: '',
+  password: '',
   hiringFocus: '',
   location: '',
   companySize: '',
@@ -49,6 +51,9 @@ function App() {
   const [jobMessage, setJobMessage] = useState('')
   const [jobs, setJobs] = useState([])
   const [currentPage, setCurrentPage] = useState('home')
+  const [supabaseStatus, setSupabaseStatus] = useState('')
+  const [creatorAuthMode, setCreatorAuthMode] = useState('signup')
+  const [recruiterAuthMode, setRecruiterAuthMode] = useState('signup')
 
   useEffect(() => {
     const savedProfile = localStorage.getItem('nexfolio-profile-v2')
@@ -110,6 +115,110 @@ function App() {
     localStorage.setItem('nexfolio-jobs-v1', JSON.stringify(jobs))
   }, [jobs])
 
+  useEffect(() => {
+    if (hasSupabaseConfig && supabase) {
+      setSupabaseStatus('Supabase connected')
+    } else {
+      setSupabaseStatus('Supabase not connected yet')
+    }
+  }, [])
+
+  useEffect(() => {
+    const syncSession = async () => {
+      if (!hasSupabaseConfig || !supabase) return
+
+      const { data: { session }, error } = await supabase.auth.getSession()
+      if (error) {
+        console.warn('Supabase session load failed', error.message)
+        return
+      }
+
+      if (!session?.user) return
+
+      const role = session.user?.user_metadata?.role || 'creator'
+      if (role === 'recruiter') {
+        setIsRecruiterSignedIn(true)
+        setRecruiterForm((prev) => ({
+          ...prev,
+          contactName: session.user.user_metadata?.name || prev.contactName,
+          email: session.user.email || prev.email
+        }))
+        setRecruiterMessage(`Welcome back, ${session.user.user_metadata?.name || 'recruiter'}`)
+      } else {
+        setIsCreatorSignedIn(true)
+        setCreatorForm((prev) => ({
+          ...prev,
+          name: session.user.user_metadata?.name || prev.name,
+          email: session.user.email || prev.email
+        }))
+        setCreatorMessage(`Welcome back, ${session.user.user_metadata?.name || 'creator'}`)
+      }
+
+      const { data: profileData, error: profileError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', session.user.id)
+        .maybeSingle()
+
+      if (!profileError && profileData) {
+        setProfile((prev) => ({
+          ...prev,
+          name: profileData.name || prev.name,
+          title: profileData.title || prev.title,
+          bio: profileData.bio || prev.bio,
+          location: profileData.location || prev.location,
+          skills: profileData.skills || prev.skills,
+          featuredWork: profileData.featured_work || prev.featuredWork
+        }))
+      }
+
+      const { data: jobData, error: jobError } = await supabase
+        .from('jobs')
+        .select('*')
+        .order('created_at', { ascending: false })
+
+      if (!jobError && jobData) {
+        setJobs(jobData)
+      }
+    }
+
+    syncSession()
+  }, [])
+
+  useEffect(() => {
+    const saveProfileToSupabase = async () => {
+      if (!hasSupabaseConfig || !supabase) return
+      if (!isCreatorSignedIn && !isRecruiterSignedIn) return
+
+      const creatorAuth = localStorage.getItem('nexfolio-creator-auth-v3')
+      const recruiterAuth = localStorage.getItem('nexfolio-recruiter-auth-v3')
+      const storedAuth = creatorAuth || recruiterAuth
+      if (!storedAuth) return
+
+      const parsedAuth = JSON.parse(storedAuth)
+      if (!parsedAuth.userId) return
+
+      const payload = {
+        id: parsedAuth.userId,
+        role: isRecruiterSignedIn ? 'recruiter' : 'creator',
+        name: profile.name.trim(),
+        title: profile.title.trim(),
+        bio: profile.bio.trim(),
+        location: profile.location.trim(),
+        skills: profile.skills.trim(),
+        featured_work: profile.featuredWork.trim(),
+        updated_at: new Date().toISOString()
+      }
+
+      const { error } = await supabase.from('profiles').upsert(payload, { onConflict: 'id' })
+      if (error) {
+        console.warn('Supabase profile auto-save failed', error.message)
+      }
+    }
+
+    saveProfileToSupabase()
+  }, [profile, isCreatorSignedIn, isRecruiterSignedIn])
+
   const handleProfileChange = (event) => {
     const { name, value } = event.target
     setProfile((prev) => ({ ...prev, [name]: value }))
@@ -135,32 +244,106 @@ function App() {
     event.target.value = ''
   }
 
+  const persistCreatorProfileToSupabase = async (userId) => {
+    if (!hasSupabaseConfig || !supabase || !userId) return
+
+    const payload = {
+      id: userId,
+      role: 'creator',
+      name: profile.name.trim(),
+      title: profile.title.trim(),
+      bio: profile.bio.trim(),
+      location: profile.location.trim(),
+      skills: profile.skills.trim(),
+      featured_work: profile.featuredWork.trim(),
+      updated_at: new Date().toISOString()
+    }
+
+    const { error } = await supabase.from('profiles').upsert(payload, { onConflict: 'id' })
+    if (error) {
+      console.warn('Supabase profile save failed', error.message)
+    }
+  }
+
   const handleCreatorChange = (event) => {
     const { name, value } = event.target
     setCreatorForm((prev) => ({ ...prev, [name]: value }))
   }
 
-  const handleCreatorSubmit = (event) => {
+  const handleCreatorSubmit = async (event) => {
     event.preventDefault()
 
-    if (!creatorForm.name.trim() || !creatorForm.email.trim()) {
-      setCreatorMessage('Please enter both your name and email.')
+    if (!creatorForm.name.trim() || !creatorForm.email.trim() || !creatorForm.password.trim()) {
+      setCreatorMessage('Please enter your name, email, and password.')
       return
     }
 
-    const authData = {
-      name: creatorForm.name.trim(),
-      email: creatorForm.email.trim()
+    if (!hasSupabaseConfig || !supabase) {
+      const authData = {
+        name: creatorForm.name.trim(),
+        email: creatorForm.email.trim(),
+        password: creatorForm.password
+      }
+
+      localStorage.setItem('nexfolio-creator-auth-v3', JSON.stringify(authData))
+      setProfile((prev) => ({ ...prev, name: authData.name }))
+      setIsCreatorSignedIn(true)
+      setCurrentPage('home')
+      setCreatorMessage(`Signed in as ${authData.name}`)
+      return
     }
 
-    localStorage.setItem('nexfolio-creator-auth-v3', JSON.stringify(authData))
-    setProfile((prev) => ({ ...prev, name: authData.name }))
-    setIsCreatorSignedIn(true)
-    setCurrentPage('home')
-    setCreatorMessage(`Signed in as ${authData.name}`)
+    try {
+      setCreatorMessage('Working on your account...')
+
+      const authAction = creatorAuthMode === 'signin'
+        ? supabase.auth.signInWithPassword({ email: creatorForm.email.trim(), password: creatorForm.password })
+        : supabase.auth.signUp({
+            email: creatorForm.email.trim(),
+            password: creatorForm.password,
+            options: { data: { name: creatorForm.name.trim(), role: 'creator' } }
+          })
+
+      const { data, error } = await authAction
+
+      if (error) {
+        setCreatorMessage(error.message)
+        return
+      }
+
+      const authUser = data.user ?? data?.session?.user
+      const authData = {
+        name: creatorForm.name.trim(),
+        email: creatorForm.email.trim(),
+        userId: authUser?.id || null
+      }
+
+      localStorage.setItem('nexfolio-creator-auth-v3', JSON.stringify(authData))
+      setProfile((prev) => ({ ...prev, name: authData.name }))
+      setIsCreatorSignedIn(true)
+      setCurrentPage('home')
+
+      if (authUser) {
+        await persistCreatorProfileToSupabase(authUser.id)
+      }
+
+      setCreatorMessage(
+        creatorAuthMode === 'signin'
+          ? `Signed in as ${authData.name}`
+          : data.session
+            ? `Welcome, ${authData.name}`
+            : 'Welcome! Please confirm your email before signing in.'
+      )
+    } catch (error) {
+      setCreatorMessage(error.message || 'Unable to connect to your account right now.')
+    }
   }
 
-  const handleCreatorSignOut = () => {
+  const handleCreatorSignOut = async () => {
+    if (supabase) {
+      await supabase.auth.signOut()
+    }
+
     localStorage.removeItem('nexfolio-creator-auth-v3')
     setIsCreatorSignedIn(false)
     setCreatorMessage('Signed out')
@@ -168,37 +351,116 @@ function App() {
     setCreatorForm(defaultCreatorForm)
   }
 
+  const persistRecruiterProfileToSupabase = async (userId) => {
+    if (!hasSupabaseConfig || !supabase || !userId) return
+
+    const payload = {
+      id: userId,
+      role: 'recruiter',
+      company_name: recruiterForm.companyName.trim(),
+      contact_name: recruiterForm.contactName.trim(),
+      hiring_focus: recruiterForm.hiringFocus.trim(),
+      location: recruiterForm.location.trim(),
+      company_size: recruiterForm.companySize.trim(),
+      website: recruiterForm.website.trim(),
+      about: recruiterForm.about.trim(),
+      updated_at: new Date().toISOString()
+    }
+
+    const { error } = await supabase.from('profiles').upsert(payload, { onConflict: 'id' })
+    if (error) {
+      console.warn('Supabase recruiter profile save failed', error.message)
+    }
+  }
+
   const handleRecruiterChange = (event) => {
     const { name, value } = event.target
     setRecruiterForm((prev) => ({ ...prev, [name]: value }))
   }
 
-  const handleRecruiterSubmit = (event) => {
+  const handleRecruiterSubmit = async (event) => {
     event.preventDefault()
 
-    if (!recruiterForm.companyName.trim() || !recruiterForm.contactName.trim() || !recruiterForm.email.trim()) {
-      setRecruiterMessage('Please enter your company name, your name, and email.')
+    if (!recruiterForm.companyName.trim() || !recruiterForm.contactName.trim() || !recruiterForm.email.trim() || !recruiterForm.password.trim()) {
+      setRecruiterMessage('Please enter your company name, your name, email, and password.')
       return
     }
 
-    const authData = {
-      companyName: recruiterForm.companyName.trim(),
-      contactName: recruiterForm.contactName.trim(),
-      email: recruiterForm.email.trim(),
-      hiringFocus: recruiterForm.hiringFocus.trim(),
-      location: recruiterForm.location.trim(),
-      companySize: recruiterForm.companySize.trim(),
-      website: recruiterForm.website.trim(),
-      about: recruiterForm.about.trim()
+    if (!hasSupabaseConfig || !supabase) {
+      const authData = {
+        companyName: recruiterForm.companyName.trim(),
+        contactName: recruiterForm.contactName.trim(),
+        email: recruiterForm.email.trim(),
+        hiringFocus: recruiterForm.hiringFocus.trim(),
+        location: recruiterForm.location.trim(),
+        companySize: recruiterForm.companySize.trim(),
+        website: recruiterForm.website.trim(),
+        about: recruiterForm.about.trim()
+      }
+
+      localStorage.setItem('nexfolio-recruiter-auth-v3', JSON.stringify(authData))
+      setIsRecruiterSignedIn(true)
+      setCurrentPage('home')
+      setRecruiterMessage(`Welcome aboard, ${authData.contactName}. ${authData.companyName} is ready to hire.`)
+      return
     }
 
-    localStorage.setItem('nexfolio-recruiter-auth-v3', JSON.stringify(authData))
-    setIsRecruiterSignedIn(true)
-    setCurrentPage('home')
-    setRecruiterMessage(`Welcome aboard, ${authData.contactName}. ${authData.companyName} is ready to hire.`)
+    try {
+      setRecruiterMessage('Working on your account...')
+
+      const authAction = recruiterAuthMode === 'signin'
+        ? supabase.auth.signInWithPassword({ email: recruiterForm.email.trim(), password: recruiterForm.password })
+        : supabase.auth.signUp({
+            email: recruiterForm.email.trim(),
+            password: recruiterForm.password,
+            options: { data: { name: recruiterForm.contactName.trim(), role: 'recruiter' } }
+          })
+
+      const { data, error } = await authAction
+
+      if (error) {
+        setRecruiterMessage(error.message)
+        return
+      }
+
+      const authUser = data.user ?? data?.session?.user
+      const authData = {
+        companyName: recruiterForm.companyName.trim(),
+        contactName: recruiterForm.contactName.trim(),
+        email: recruiterForm.email.trim(),
+        hiringFocus: recruiterForm.hiringFocus.trim(),
+        location: recruiterForm.location.trim(),
+        companySize: recruiterForm.companySize.trim(),
+        website: recruiterForm.website.trim(),
+        about: recruiterForm.about.trim(),
+        userId: authUser?.id || null
+      }
+
+      localStorage.setItem('nexfolio-recruiter-auth-v3', JSON.stringify(authData))
+      setIsRecruiterSignedIn(true)
+      setCurrentPage('home')
+
+      if (authUser) {
+        await persistRecruiterProfileToSupabase(authUser.id)
+      }
+
+      setRecruiterMessage(
+        recruiterAuthMode === 'signin'
+          ? `Welcome back, ${authData.contactName}`
+          : data.session
+            ? `Welcome aboard, ${authData.contactName}. ${authData.companyName} is ready to hire.`
+            : 'Welcome! Please confirm your email before signing in.'
+      )
+    } catch (error) {
+      setRecruiterMessage(error.message || 'Unable to connect to your account right now.')
+    }
   }
 
-  const handleRecruiterSignOut = () => {
+  const handleRecruiterSignOut = async () => {
+    if (supabase) {
+      await supabase.auth.signOut()
+    }
+
     localStorage.removeItem('nexfolio-recruiter-auth-v3')
     setIsRecruiterSignedIn(false)
     setRecruiterMessage('Signed out')
@@ -211,7 +473,7 @@ function App() {
     setJobForm((prev) => ({ ...prev, [name]: value }))
   }
 
-  const handleJobSubmit = (event) => {
+  const handleJobSubmit = async (event) => {
     event.preventDefault()
 
     if (!jobForm.title.trim() || !jobForm.location.trim() || !jobForm.description.trim()) {
@@ -220,7 +482,6 @@ function App() {
     }
 
     const newJob = {
-      id: `${Date.now()}`,
       title: jobForm.title.trim(),
       location: jobForm.location.trim(),
       type: jobForm.type,
@@ -231,7 +492,27 @@ function App() {
       perks: jobForm.perks.trim() || 'Great team, strong growth opportunity'
     }
 
-    setJobs((prev) => [newJob, ...prev])
+    if (hasSupabaseConfig && supabase) {
+      const { data, error } = await supabase
+        .from('jobs')
+        .insert({
+          ...newJob,
+          company_name: recruiterForm.companyName.trim() || 'Nexfolio',
+          created_at: new Date().toISOString()
+        })
+        .select()
+
+      if (!error && data?.[0]) {
+        setJobs((prev) => [data[0], ...prev])
+        setJobForm(defaultJobForm)
+        setJobMessage('Job posted successfully')
+        return
+      }
+
+      console.warn('Supabase job save failed', error?.message)
+    }
+
+    setJobs((prev) => [{ id: `${Date.now()}`, ...newJob }, ...prev])
     setJobForm(defaultJobForm)
     setJobMessage('Job posted successfully')
   }
@@ -271,7 +552,7 @@ function App() {
             <div className="hero-content">
               <h1>Showcase Your Talent.</h1>
               <h2>Get Discovered.</h2>
-
+              <p className="auth-message" style={{ marginBottom: '16px' }}>{supabaseStatus}</p>
               <p>
                 Nexfolio connects creative professionals with recruiters through
                 beautiful digital portfolios.
@@ -394,6 +675,11 @@ function App() {
 
               {!isCreatorSignedIn ? (
                 <form className="profile-form auth-form" onSubmit={handleCreatorSubmit}>
+                  <div className="buttons" style={{ justifyContent: 'flex-start', marginBottom: '8px' }}>
+                    <button type="button" className={`secondary ${creatorAuthMode === 'signup' ? 'active' : ''}`} onClick={() => setCreatorAuthMode('signup')}>Sign up</button>
+                    <button type="button" className={`secondary ${creatorAuthMode === 'signin' ? 'active' : ''}`} onClick={() => setCreatorAuthMode('signin')}>Sign in</button>
+                  </div>
+
                   <label>
                     Your name
                     <input name="name" value={creatorForm.name} onChange={handleCreatorChange} />
@@ -401,10 +687,15 @@ function App() {
 
                   <label>
                     Email
-                    <input name="email" value={creatorForm.email} onChange={handleCreatorChange} />
+                    <input name="email" type="email" value={creatorForm.email} onChange={handleCreatorChange} />
                   </label>
 
-                  <button className="primary auth-btn" type="submit">Create account</button>
+                  <label>
+                    Password
+                    <input name="password" type="password" value={creatorForm.password} onChange={handleCreatorChange} />
+                  </label>
+
+                  <button className="primary auth-btn" type="submit">{creatorAuthMode === 'signup' ? 'Create account' : 'Sign in'}</button>
                   {creatorMessage ? <p className="auth-message">{creatorMessage}</p> : null}
                 </form>
               ) : (
@@ -723,6 +1014,11 @@ function App() {
               <h3>Company profile</h3>
               {!isRecruiterSignedIn ? (
                 <form className="profile-form" onSubmit={handleRecruiterSubmit}>
+                  <div className="buttons" style={{ justifyContent: 'flex-start', marginBottom: '8px' }}>
+                    <button type="button" className={`secondary ${recruiterAuthMode === 'signup' ? 'active' : ''}`} onClick={() => setRecruiterAuthMode('signup')}>Sign up</button>
+                    <button type="button" className={`secondary ${recruiterAuthMode === 'signin' ? 'active' : ''}`} onClick={() => setRecruiterAuthMode('signin')}>Sign in</button>
+                  </div>
+
                   <label>
                     Company name
                     <input name="companyName" value={recruiterForm.companyName} onChange={handleRecruiterChange} />
@@ -735,7 +1031,12 @@ function App() {
 
                   <label>
                     Email
-                    <input name="email" value={recruiterForm.email} onChange={handleRecruiterChange} />
+                    <input name="email" type="email" value={recruiterForm.email} onChange={handleRecruiterChange} />
+                  </label>
+
+                  <label>
+                    Password
+                    <input name="password" type="password" value={recruiterForm.password} onChange={handleRecruiterChange} />
                   </label>
 
                   <label>
@@ -763,7 +1064,7 @@ function App() {
                     <textarea name="about" rows="3" value={recruiterForm.about} onChange={handleRecruiterChange} placeholder="Tell creatives why your company is a great place to work" />
                   </label>
 
-                  <button className="primary auth-btn" type="submit">Create recruiter account</button>
+                  <button className="primary auth-btn" type="submit">{recruiterAuthMode === 'signup' ? 'Create recruiter account' : 'Sign in'}</button>
                   {recruiterMessage ? <p className="auth-message">{recruiterMessage}</p> : null}
                 </form>
               ) : (
